@@ -1,0 +1,83 @@
+# Keeps the Family Quest Supabase project from idle-pausing.
+#
+# The project is on the free plan, which pauses after roughly seven days
+# without activity and stops its hostname resolving — the app then fails on
+# launch with "A server with the specified hostname could not be found", which
+# is exactly how build 14 died on 2026-08-24. Staying on the free plan is a
+# deliberate decision for the first small-audience release, so something has to
+# keep the project warm.
+#
+# This calls public.keepalive() (migration 0017 in the app repo), which takes
+# no arguments, reads no table and returns the server clock. The call goes
+# through PostgREST into Postgres, so it registers as real activity — a plain
+# read of a protected table would be rejected at the gateway and might never
+# reach the database.
+#
+# Daily, so a skipped or delayed run (GitHub does not guarantee cron timing)
+# still leaves six days of margin. The stamp commit exists only so the
+# repository keeps seeing activity: GitHub disables scheduled workflows in a
+# repository that has been inactive for 60 days, which would silently remove
+# the protection.
+name: supabase-keepalive
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: supabase-keepalive
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Call keepalive()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SUPABASE_URL}" ] || [ -z "${SUPABASE_ANON_KEY}" ]; then
+            echo "::error::SUPABASE_URL / SUPABASE_ANON_KEY repository secrets are not set."
+            exit 1
+          fi
+
+          # Five attempts over ~4 minutes. A project that has already paused
+          # answers 521 and needs a manual restore, so a persistent failure
+          # must fail the run loudly rather than pass quietly.
+          for attempt in 1 2 3 4 5; do
+            code=$(curl -sS -o response.txt -w '%{http_code}' --max-time 30 \
+              -X POST "${SUPABASE_URL}/rest/v1/rpc/keepalive" \
+              -H "apikey: ${SUPABASE_ANON_KEY}" \
+              -H 'Content-Type: application/json' \
+              -d '{}' || echo 000)
+            if [ "${code}" = "200" ]; then
+              echo "keepalive ok: $(cat response.txt)"
+              exit 0
+            fi
+            echo "attempt ${attempt}: HTTP ${code} $(cat response.txt 2>/dev/null | head -c 200)"
+            [ "${attempt}" -lt 5 ] && sleep 60
+          done
+
+          echo "::error::keepalive failed — the project may be paused. Restore it in the Supabase dashboard."
+          exit 1
+
+      - name: Stamp the last successful ping
+        run: |
+          set -euo pipefail
+          mkdir -p .github
+          date -u +"last successful Supabase keepalive: %Y-%m-%dT%H:%M:%SZ" > .github/keepalive-stamp.txt
+          if [ -n "$(git status --porcelain .github/keepalive-stamp.txt)" ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .github/keepalive-stamp.txt
+            git commit -m "Supabase keepalive stamp [skip ci]"
+            git push
+          fi
